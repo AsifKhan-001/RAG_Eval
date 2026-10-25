@@ -1,138 +1,110 @@
-
-# eval_application.py
+# online/triad_worker.py
 import os
-from dotenv import load_dotenv
+import time
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
 
-from deepeval import evaluate
-from deepeval.test_case import LLMTestCase, LLMTestCaseParams
-from deepeval.metrics import GEval
-from deepeval.metrics.g_eval import Rubric
+load_dotenv(find_dotenv(usecwd=True))
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+from langsmith import Client
+
 from deepeval.models import GeminiModel
+from deepeval.test_case import LLMTestCase
+from deepeval.metrics import (
+    FaithfulnessMetric,
+    AnswerRelevancyMetric,
+    ContextualRelevancyMetric,
+)
 
-from src.rag_pipeline import RagPipeline
-from evals.harness import load_goldens, summarize_by_metric, print_summary
-
-load_dotenv()
-
-GOLDEN_PATH = "goldens/correctness_goldens.json"
+PROJECT = "cx doubt solver"
 JUDGE_MODEL = "gemini-2.5-flash"
 THRESHOLD = 0.7
+SAMPLE_RATE = 1          # ~30% of traffic — 3 metrics × several calls each = expensive
+POLL_SECONDS = 60
 
-# Configure Google Gemini as the evaluation judge
+GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if not GEMINI_KEY:
+    raise SystemExit("No Gemini key found. Add GEMINI_API_KEY=<key> to your .env file.")
+
 gemini_judge = GeminiModel(
     model=JUDGE_MODEL,
-    api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
+    api_key=GEMINI_KEY,
     temperature=0,
 )
 
+client = Client()
 
-def run(rag):
-    # 1. LOAD queries + ideal answers
-    goldens = load_goldens(GOLDEN_PATH)
 
-    # 2. RUN THE INJECTED PIPELINE per query, build a test case from LIVE output
-    test_cases = []
-    for g in goldens:
-        result = rag.invoke(g["question"])  # retrieve -> rerank -> generate
+def _sampled(run):
+    """Deterministic per-run sampling: same run always decided the same way."""
+    return hash(str(run.id)) % 100 < SAMPLE_RATE * 100
 
-        test_cases.append(
-            LLMTestCase(
-                input=g["question"],
-                actual_output=result["answer"],
-                expected_output=g["ideal_answer"],
-            )
-        )
 
-    # 3. THREE APPLICATION-LEVEL QUALITY METRICS
+def _existing_keys(run):
+    """Which feedback keys this run already has — so we never re-judge a key."""
+    fb = client.list_feedback(run_ids=[run.id])
+    return {f.key for f in fb}
 
-    # 3a. CORRECTNESS --- reference-based, judges TRUTH (not coverage or length)
-    correctness = GEval(
-        name="Correctness",
-        evaluation_steps=[
-            "Compare only the factual claims in the actual output against the expected output.",
-            "A claim is wrong only if it CONTRADICTS the expected output or is factually false. Judge truth, not completeness.",
-            "A factually accurate answer must score at least 0.9 even if it is shorter or covers fewer points than the expected output.",
-            "Do NOT deduct for brevity, missing elaboration, or omitted points --- omissions are not errors here.",
-            "Additional correct information must NEVER lower the score.",
-        ],
-        rubric=[
-            Rubric(score_range=(9, 10), expected_outcome="All stated claims are factually correct and consistent. No contradictions. Brevity is fine."),
-            Rubric(score_range=(5, 8), expected_outcome="Mostly correct but one minor inaccuracy."),
-            Rubric(score_range=(0, 4), expected_outcome="Contains a clear factual error or a claim that contradicts the expected output."),
-        ],
-        evaluation_params=[
-            LLMTestCaseParams.INPUT,
-            LLMTestCaseParams.ACTUAL_OUTPUT,
-            LLMTestCaseParams.EXPECTED_OUTPUT,
-        ],
-        threshold=THRESHOLD,
-        model=gemini_judge,
-        strict_mode=False,
+
+def score_recent_traces():
+    """One pass: read recent RagPipeline traces, score any missing triad metric, push feedback."""
+    runs = client.list_runs(
+        project_name=PROJECT,
+        is_root=True,             # RagPipeline root only, not child spans
+        run_type="chain",
     )
 
-    # 3b. COMPLETENESS --- reference-based, judges COVERAGE (not correctness)
-    completeness = GEval(
-        name="Completeness",
-        evaluation_steps=[
-            "Identify the key points contained in the expected output.",
-            "Check how many of those key points are addressed in the actual output.",
-            "Penalize the actual output for each key point from the expected output that it omits or only partially covers.",
-            "Judge coverage only. Do NOT lower the score because a covered point is stated incorrectly --- factual correctness is judged separately.",
-            "Do NOT penalize the actual output for adding extra information beyond the expected output.",
-        ],
-        rubric=[
-            Rubric(score_range=(9, 10), expected_outcome="Addresses essentially all key points in the expected output."),
-            Rubric(score_range=(5, 8), expected_outcome="Covers the main key points but misses one or more."),
-            Rubric(score_range=(0, 4), expected_outcome="Misses several key points; only partially covers the expected output."),
-        ],
-        evaluation_params=[
-            LLMTestCaseParams.INPUT,
-            LLMTestCaseParams.ACTUAL_OUTPUT,
-            LLMTestCaseParams.EXPECTED_OUTPUT,
-        ],
-        threshold=THRESHOLD,
-        model=gemini_judge,
-        strict_mode=False,
-    )
+    for run in runs:
+        if not _sampled(run):
+            continue
 
-    # 3c. STYLE --- reference-free, judges TONE only (note: no EXPECTED_OUTPUT)
-    style = GEval(
-        name="Style",
-        evaluation_steps=[
-            "Judge only the teaching style and tone of the actual output, not whether it is factually correct or complete.",
-            "Reward an intuitive, explanatory tone: plain language, the idea explained before any formula or jargon, and technical terms briefly unpacked when used.",
-            "Reward a direct, conversational register written in prose, as a CampusX lecture would explain it out loud, rather than a dry, formal, or bullet-list tone.",
-            "An analogy or concrete example is a BONUS when the concept is abstract, but a clear, direct, well-explained answer is fully acceptable and must NOT be penalized for not having one.",
-            "Penalize answers that are stiff, bureaucratic, structured as a bare list with no explanation, or that use unexplained jargon.",
-            "Do NOT reward or penalize based on correctness, completeness, or length --- only on style and tone.",
-        ],
-        rubric=[
-            Rubric(score_range=(9, 10), expected_outcome="Clearly in a CampusX teaching voice: intuitive, conversational prose that explains before it formalizes."),
-            Rubric(score_range=(7, 8), expected_outcome="Clear, conversational, and well-explained in prose. Fully acceptable even without an analogy or example."),
-            Rubric(score_range=(4, 6), expected_outcome="Understandable but somewhat flat, formal, or list-heavy in places."),
-            Rubric(score_range=(0, 3), expected_outcome="Dry, stiff, bare-list, jargon-heavy, or robotic; does not read like a teaching explanation."),
-        ],
-        evaluation_params=[
-            LLMTestCaseParams.INPUT,
-            LLMTestCaseParams.ACTUAL_OUTPUT,
-        ],
-        threshold=THRESHOLD,
-        model=gemini_judge,
-        strict_mode=False,
-    )
+        outputs = run.outputs or {}
+        answer = outputs.get("answer")
+        context = outputs.get("context")     # post-rerank chunks — same field offline uses
+        query = (run.inputs or {}).get("query", "")
 
-    # 4. EVALUATE --- all three together
-    result = evaluate(
-        test_cases=test_cases,
-        metrics=[correctness, completeness, style],
-    )
-    return summarize_by_metric(result)
+        if not answer or not context:
+            continue                          # nothing to judge
 
+        already = _existing_keys(run)
 
-def run_local():
-    """Standalone convenience: build the pipeline, then run."""
-    return run(RagPipeline())
+        # each metric: (feedback key, metric object, which inputs it needs)
+        # built fresh per run so scores/reasons don't leak between traces
+        jobs = [
+            ("faithfulness",
+             FaithfulnessMetric(threshold=THRESHOLD, model=gemini_judge, include_reason=True),
+             dict(input=query, actual_output=answer, retrieval_context=context)),
+
+            ("answer_relevancy",
+             AnswerRelevancyMetric(threshold=THRESHOLD, model=gemini_judge, include_reason=True),
+             dict(input=query, actual_output=answer)),
+
+            ("contextual_relevancy",
+             ContextualRelevancyMetric(threshold=THRESHOLD, model=gemini_judge, include_reason=True),
+             dict(input=query, actual_output=answer, retrieval_context=context)),
+        ]
+
+        for key, metric, tc_kwargs in jobs:
+            if key in already:
+                continue                      # per-key dedup: skip only what's already scored
+
+            try:
+                metric.measure(LLMTestCase(**tc_kwargs))
+                client.create_feedback(
+                    run_id=run.id,
+                    key=key,
+                    score=metric.score,
+                    comment=metric.reason,
+                )
+            except Exception as e:
+                # one metric failing shouldn't sink the other two for this trace
+                print(f"[{key}] failed on run {run.id}: {e}")
 
 
 if __name__ == "__main__":
-    print_summary("application", run_local())
+    # live-in-a-terminal version. For production, delete the loop and let cron
+    # call score_recent_traces() on a schedule instead.
+    while True:
+        score_recent_traces()
+        time.sleep(POLL_SECONDS)

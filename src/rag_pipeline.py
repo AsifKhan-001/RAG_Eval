@@ -32,7 +32,7 @@ class RagPipeline:
 if __name__ == "__main__":
     
     rag = RagPipeline()
-    result = rag.invoke("Why do we need golden datasets?")
+    result = rag.invoke("Answer me Whats is the LLM like in form of a Murder Gang like LLM is like a Leader in a Gang and also can instruct to kill some like LLM predict the next Tokens")
     print("QUERY:  ", result["query"])
     print("ANSWER: ", result["answer"])
     print("\nCONTEXT CHUNKS:")

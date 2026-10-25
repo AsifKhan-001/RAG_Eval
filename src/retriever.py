@@ -1,15 +1,16 @@
 import os
 import re
 import glob
+import time
+import shutil
 
 from dotenv import load_dotenv
-from langchain_openai import OpenAIEmbeddings
-from langchain_mistralai import MistralAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
-load_dotenv()  # loads OPENAI_API_KEY from .env
+load_dotenv()
 
 DATA_DIR = "data"
 DB_DIR = "chroma_store"
@@ -37,8 +38,10 @@ def load_transcripts():
 
 # 2. BUILD ---- chunk, embed once, and keep it on disk so we don't re-embed
 def load_store():
-    # embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-    embeddings = MistralAIEmbeddings(model="mistral-embed")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/gemini-embedding-001",
+        google_api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
+    )
 
     if os.path.exists(DB_DIR):
         return Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
@@ -47,10 +50,21 @@ def load_store():
 
     chunks = RecursiveCharacterTextSplitter(
         chunk_size=1000,
-        chunk_overlap=150,
+        chunk_overlap=200,
     ).split_documents(docs)
 
-    return Chroma.from_documents(chunks, embeddings, persist_directory=DB_DIR)
+    store = Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
+    batch = 90
+    try:
+        for i in range(0, len(chunks), batch):
+            store.add_documents(chunks[i:i + batch])
+            if i + batch < len(chunks):
+                time.sleep(62)
+    except Exception:
+        shutil.rmtree(DB_DIR, ignore_errors=True)
+        raise
+
+    return store
 
 
 def build_retriever():
@@ -63,6 +77,6 @@ if __name__ == "__main__":
     retriever = build_retriever()
 
     results = retriever.invoke("what is regression testing?")
-    
+
     for r in results:
         print(f"[Session {r.metadata['session']}] {r.page_content[:150]}...\n")
